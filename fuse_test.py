@@ -106,21 +106,49 @@ class Passthrough(Operations):
             udf, bucket_name, file_name = udf_fields
 
             print("Making API call...")
-            try:
-                # Change working directory to root or another safe location
-                # original_cwd = os.getcwd()
-                # os.chdir("/")
+            try:                
+                try:
+                    params = {
+                        "f": "json",
+                        "loginId": "test",
+                        "password": "test",
+                        "application": "test",
+                        "source": "flight",
+                    }
 
-                api_response_bytes = udf_api_call(bucket_name, file_name, udf)
+                    encoded_params = urllib.parse.urlencode(params)
+                    url = f"http://127.0.0.1:8010/admin/login?{encoded_params}"
+
+                    response = requests.get(url)
+                    response.raise_for_status()
+                    json_data = response.json()
+                    user_token = json_data["AdminResponse"]["token"]
+
+                    body = {
+                        "bucketName": bucket_name,
+                        "objectName": file_name,
+                        "udf": udf,
+                        "input": '{"x": 1}',
+                    }
+
+                    headers = {
+                        "authorization": f"Bearer {user_token}",
+                    }
+
+                    url = "http://127.0.0.1:8010/udf_api"
+                    response = requests.post(url, json=body, headers=headers)
+                    response.raise_for_status()
+                finally:
+                    # Write the API response bytes to stdout
+                    sys.stdout.buffer.write(response.content)
+
+                api_response_bytes = response.content
+                # api_response_bytes = udf_api_call(bucket_name, file_name, udf)
                 self.api_response_data[full_path] = api_response_bytes
                 print(f"API call successful, response length: {len(api_response_bytes)} bytes")
             except Exception as e:
                 print(f"API call failed: {e}")
                 raise FuseOSError(errno.EIO)
-            # finally:
-                # Restore the original working directory
-                # os.chdir(original_cwd)
-
             return os.open("/dev/null", flags)
         else:
             return os.open(full_path, flags)
