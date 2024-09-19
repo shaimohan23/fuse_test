@@ -2,255 +2,252 @@ from __future__ import with_statement
 
 import os
 import sys
-import errno
+import time
+import errno 
 import requests
 import urllib.parse
 
 import subprocess
 
-from fuse import FUSE, FuseOSError, Operations
+# from fuse import FUSE, FuseOSError, Operations
+import fuse
+from fuse import Fuse
 
-class Passthrough(Operations):
-    def __init__(self, root):
-        self.root = root
+
+if not hasattr(fuse, '__version__'):
+    raise RuntimeError("your fuse-py doesn't know of fuse.__version__, probably it's too old.")
+
+fuse.fuse_python_api = (0, 2)
+
+fuse.feature_assert('stateful_files', 'has_init')
+
+class Passthrough(Fuse):
+    def __init__(self, *args, **kw):
+        self.root = os.getcwd()
         self.api_response_data = {}
+
+        Fuse.__init__(self, *args, **kw)
 
     # Helpers
     # =======
+    def getattr(self, path):
+        # return os.lstat("." + path)
+        full_path = os.path.join(self.mount, path.lstrip('/'))
+        
+        # Create a new fuse.Stat() object to store file attributes
+        st = fuse.Stat()
+
+        # Default to the stat of the underlying file
+        try:
+            # If it's a regular file, use lstat
+            stat_result = os.lstat("." + path)
+            st.st_mode = stat_result.st_mode
+            st.st_ino = stat_result.st_ino
+            st.st_dev = stat_result.st_dev
+            st.st_nlink = stat_result.st_nlink
+            st.st_uid = stat_result.st_uid
+            st.st_gid = stat_result.st_gid
+            st.st_size = stat_result.st_size  # Default size (will be overridden if it's API data)
+            st.st_atime = stat_result.st_atime
+            st.st_mtime = stat_result.st_mtime
+            st.st_ctime = stat_result.st_ctime
+        except FileNotFoundError:
+            pass
+
+        # Check if the file has API response data
+        if full_path in self.api_response_data:
+            # Set the correct size of the file based on the response data length
+            size = len(self.api_response_data[full_path])
+            st.st_size = size  # Set the correct size
+            print(f"Setting file size for {path}: {size} bytes")
+
+        return st
+
+    def readlink(self, path):
+        return os.readlink("." + path)
+
+    def readdir(self, path, offset):
+        for e in os.listdir("." + path):
+            yield fuse.Direntry(e)
+
+    def unlink(self, path):
+        os.unlink("." + path)
+
+    def rmdir(self, path):
+        os.rmdir("." + path)
+
+    def symlink(self, path, path1):
+        os.symlink(path, "." + path1)
+
+    def rename(self, path, path1):
+        os.rename("." + path, "." + path1)
+
+    def link(self, path, path1):
+        os.link("." + path, "." + path1)
+
+    def chmod(self, path, mode):
+        os.chmod("." + path, mode)
+
+    def chown(self, path, user, group):
+        os.chown("." + path, user, group)
+
+    def truncate(self, path, len):
+        f = open("." + path, "a")
+        f.truncate(len)
+        f.close()
+
+    def mknod(self, path, mode, dev):
+        os.mknod("." + path, mode, dev)
+
+    def mkdir(self, path, mode):
+        os.mkdir("." + path, mode)
+
+    def utime(self, path, times):
+        os.utime("." + path, times)
+
+    def access(self, path, mode):
+        if not os.access("." + path, mode):
+            return -errno.EACCES
+
+    def statfs(self):
+        """
+        Should return an object with statvfs attributes (f_bsize, f_frsize...).
+        Eg., the return value of os.statvfs() is such a thing (since py 2.2).
+        If you are not reusing an existing statvfs object, start with
+        fuse.StatVFS(), and define the attributes.
+
+        To provide usable information (i.e., you want sensible df(1)
+        output, you are suggested to specify the following attributes:
+
+            - f_bsize - preferred size of file blocks, in bytes
+            - f_frsize - fundamental size of file blcoks, in bytes
+                [if you have no idea, use the same as blocksize]
+            - f_blocks - total number of blocks in the filesystem
+            - f_bfree - number of free blocks
+            - f_files - total number of file inodes
+            - f_ffree - nunber of free file inodes
+        """
+
+        return os.statvfs(".")
+
+    def fsinit(self):
+        os.chdir(self.root)
+
 
     def _full_path(self, partial):
         partial = partial.lstrip("/")
         path = os.path.join(self.root, partial)
         return path
 
-    # Filesystem methods
-    # ==================
-
-    def access(self, path, mode):
-        full_path = self._full_path(path)
-        if not os.access(full_path, mode):
-            raise FuseOSError(errno.EACCES)
-
-    def chmod(self, path, mode):
-        full_path = self._full_path(path)
-        return os.chmod(full_path, mode)
-
-    def chown(self, path, uid, gid):
-        full_path = self._full_path(path)
-        return os.chown(full_path, uid, gid)
-
-    def getattr(self, path, fh=None):
-        full_path = self._full_path(path)
-        st = os.lstat(full_path)
-        return dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
-                     'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
-
-    def readdir(self, path, fh):
-        full_path = self._full_path(path)
-
-        dirents = ['.', '..']
-        if os.path.isdir(full_path):
-            dirents.extend(os.listdir(full_path))
-        for r in dirents:
-            yield r
-
-    def readlink(self, path):
-        pathname = os.readlink(self._full_path(path))
-        if pathname.startswith("/"):
-            # Path name is absolute, sanitize it.
-            return os.path.relpath(pathname, self.root)
-        else:
-            return pathname
-
-    def mknod(self, path, mode, dev):
-        return os.mknod(self._full_path(path), mode, dev)
-
-    def rmdir(self, path):
-        full_path = self._full_path(path)
-        return os.rmdir(full_path)
-
-    def mkdir(self, path, mode):
-        return os.mkdir(self._full_path(path), mode)
-
-    def statfs(self, path):
-        full_path = self._full_path(path)
-        stv = os.statvfs(full_path)
-        return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
-            'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
-            'f_frsize', 'f_namemax'))
-
-    def unlink(self, path):
-        return os.unlink(self._full_path(path))
-
-    def symlink(self, name, target):
-        return os.symlink(name, self._full_path(target))
-
-    def rename(self, old, new):
-        return os.rename(self._full_path(old), self._full_path(new))
-
-    def link(self, target, name):
-        return os.link(self._full_path(target), self._full_path(name))
-
-    def utimens(self, path, times=None):
-        return os.utime(self._full_path(path), times)
 
     # File methods
     # ============
 
     def open(self, path, flags):
-        full_path = self._full_path(path)
+        full_path = os.path.join(self.mount, path.lstrip('/'))
         path_split = full_path.split("/")
 
         if len(path_split) >= 3 and (path_split[-1].endswith(".h5") or path_split[-1].endswith(".hdf5")):
             udf_fields = path_split[-3:]
             udf, bucket_name, file_name = udf_fields
 
-            print("Making API call...")
-            try:                
-                try:
-                    params = {
-                        "f": "json",
-                        "loginId": "test",
-                        "password": "test",
-                        "application": "test",
-                        "source": "flight",
-                    }
+            formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
+            print(f"Making API call at {formatted_time}")
+            try:
+                params = {
+                    "f": "json",
+                    "loginId": "test",
+                    "password": "test",
+                    "application": "test",
+                    "source": "flight",
+                }
 
-                    encoded_params = urllib.parse.urlencode(params)
-                    url = f"http://127.0.0.1:8010/admin/login?{encoded_params}"
+                encoded_params = urllib.parse.urlencode(params)
+                url = f"http://127.0.0.1:8010/admin/login?{encoded_params}"
 
-                    response = requests.get(url)
-                    response.raise_for_status()
-                    json_data = response.json()
-                    user_token = json_data["AdminResponse"]["token"]
+                response = requests.get(url)
+                response.raise_for_status()
+                json_data = response.json()
+                # print(f"{json_data=}")
+                user_token = json_data["AdminResponse"]["token"]
 
-                    body = {
-                        "bucketName": bucket_name,
-                        "objectName": file_name,
-                        "udf": udf,
-                        "input": '{"x": 1}',
-                    }
+                # print(f"{bucket_name=}, {udf=}, {file_name=}")
 
-                    headers = {
-                        "authorization": f"Bearer {user_token}",
-                    }
+                body = {
+                    "bucketName": bucket_name,
+                    "objectName": file_name,
+                    "udf": udf,
+                    "input": '{"x": 1}',
+                }
 
-                    url = "http://127.0.0.1:8010/udf_api"
-                    response = requests.post(url, json=body, headers=headers)
-                    response.raise_for_status()
-                finally:
-                    # Write the API response bytes to stdout
-                    sys.stdout.buffer.write(response.content)
+                headers = {
+                    "authorization": f"Bearer {user_token}",
+                }
 
-                api_response_bytes = response.content
-                # api_response_bytes = udf_api_call(bucket_name, file_name, udf)
-                self.api_response_data[full_path] = api_response_bytes
-                print(f"API call successful, response length: {len(api_response_bytes)} bytes")
+                url = "http://localhost:8010/udf_api"
+                response = requests.post(url, json=body, headers=headers)
+                # print(f"{response.content.decode('ascii')=}{response.status_code=}")
+                response.raise_for_status()
+                self.api_response_data[full_path] = response.content
+                self.getattr(path)
+                return 0
             except Exception as e:
                 print(f"API call failed: {e}")
-                raise FuseOSError(errno.EIO)
-            return os.open("/dev/null", flags)
+                return -errno.EIO
         else:
             return os.open(full_path, flags)
-
-    def create(self, path, mode, fi=None):
-        full_path = self._full_path(path)
-        return os.open(full_path, os.O_WRONLY | os.O_CREAT, mode)
-
-    def read(self, path, length, offset, fh):
-        full_path = self._full_path(path)
+    
+    def read(self, path, size, offset):
+        full_path = os.path.join(self.mount, path.lstrip('/'))
         if full_path in self.api_response_data:
-            # Get the API response bytes
             data = self.api_response_data[full_path]
             data_length = len(data)
-            print(f"API response data length: {data_length}")
-            print(f"Requested range: {offset} to {offset + length}")
-
+            
+            # Ensure the offset is within bounds
             if offset >= data_length:
-                print("Offset beyond data length, returning empty response.")
                 return b''
             
-            # Calculate the slice end to ensure we don't read out of bounds
-            slice_end = min(offset + length, data_length)
-            print(f"Returning data slice from {offset} to {slice_end}")
+            # slice_end = min(offset + size, data_length)
+            # print(f"{data.decode('ascii')=}")
+            # return data[offset:slice_end]
+        
+            slice_end = min(offset + size, data_length)
+            data_slice = data[offset:slice_end]
+            
+            # Debug output
+            print(f"Returning data slice from {offset} to {slice_end}: {data_slice}")
 
-            return data[offset:slice_end]
-            # return data[offset:offset + length]
+            # Return the requested data slice
+            return data_slice
         else:
-            os.lseek(fh, offset, os.SEEK_SET)
-            return os.read(fh, length)
+            # If the data is not found in memory, return an error or empty data
+            return b''
 
-    def write(self, path, buf, offset, fh):
-        os.lseek(fh, offset, os.SEEK_SET)
-        return os.write(fh, buf)
+def main():
 
-    def truncate(self, path, length, fh=None):
-        full_path = self._full_path(path)
-        with open(full_path, 'r+') as f:
-            f.truncate(length)
+    usage = """
+Userspace nullfs-alike: mirror the filesystem tree from some point on.
 
-    def flush(self, path, fh):
-        return os.fsync(fh)
+""" + Fuse.fusage
 
-    def release(self, path, fh):
-        return os.close(fh)
+    server = Passthrough(version="%prog " + fuse.__version__,
+                 usage=usage,
+                 dash_s_do='setsingle')
 
-    def fsync(self, path, fdatasync, fh):
-        return self.flush(path, fh)
-
-
-def udf_api_call(bucket_name, file_name, udf):
-    # Backup environment variables
-    # original_env = os.environ.copy()
-
-    # Clear environment variables that may cause file access
-    # os.environ.pop('HTTP_PROXY', None)
-    # os.environ.pop('HTTPS_PROXY', None)
-    # os.environ.pop('NO_PROXY', None)
-    # os.environ['HOME'] = '/tmp'
-    # os.environ['REQUESTS_CA_BUNDLE'] = ''
+    server.parser.add_option(mountopt="root", metavar="PATH", default='/',
+                             help="mirror filesystem from under PATH [default: %default]")
+    server.parse(values=server, errex=1)
+    server.mount = server.fuse_args.assemble()[1]
 
     try:
-        params = {
-            "f": "json",
-            "loginId": "test",
-            "password": "test",
-            "application": "test",
-            "source": "flight",
-        }
+        if server.fuse_args.mount_expected():
+            os.chdir(server.root)
+    except OSError:
+        print("can't enter root of underlying filesystem", file=sys.stderr)
+        sys.exit(1)
 
-        encoded_params = urllib.parse.urlencode(params)
-        url = f"http://127.0.0.1:8010/admin/login?{encoded_params}"
-
-        response = requests.get(url)
-        response.raise_for_status()
-        json_data = response.json()
-        user_token = json_data["AdminResponse"]["token"]
-
-        body = {
-            "bucketName": bucket_name,
-            "objectName": file_name,
-            "udf": udf,
-            "input": '{"x": 1}',
-        }
-
-        headers = {
-            "authorization": f"Bearer {user_token}",
-        }
-
-        url = "http://127.0.0.1:8010/udf_api"
-        response = requests.post(url, json=body, headers=headers)
-        response.raise_for_status()
-    finally:
-        # Restore original environment variables
-        # os.environ.clear()
-        # os.environ.update(original_env)
-        # Write the API response bytes to stdout
-        sys.stdout.buffer.write(response.content)
-        return response.content
-
-def main(mountpoint, root):
-    FUSE(Passthrough(root), mountpoint, nothreads=True, foreground=True)
+    server.main()
 
 if __name__ == '__main__':
-    main(sys.argv[2], sys.argv[1])
+    # main(sys.argv[2], sys.argv[1])
+    main()
