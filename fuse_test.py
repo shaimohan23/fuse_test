@@ -5,6 +5,7 @@ import sys
 import time
 import errno 
 import requests
+import logging
 import urllib.parse
 
 import subprocess
@@ -13,6 +14,8 @@ import subprocess
 import fuse
 from fuse import Fuse
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+logger = logging.getLogger(__name__) 
 
 if not hasattr(fuse, '__version__'):
     raise RuntimeError("your fuse-py doesn't know of fuse.__version__, probably it's too old.")
@@ -32,6 +35,7 @@ class Passthrough(Fuse):
     # =======
     def getattr(self, path):
         # return os.lstat("." + path)
+        logger.info(f"getattr() called for path: {path}")
         full_path = os.path.join(self.mount, path.lstrip('/'))
         
         # Create a new fuse.Stat() object to store file attributes
@@ -52,14 +56,15 @@ class Passthrough(Fuse):
             st.st_mtime = stat_result.st_mtime
             st.st_ctime = stat_result.st_ctime
         except FileNotFoundError:
-            pass
+            logger.error(f"File not found: {path}")
 
         # Check if the file has API response data
         if full_path in self.api_response_data:
             # Set the correct size of the file based on the response data length
             size = len(self.api_response_data[full_path])
             st.st_size = size  # Set the correct size
-            print(f"Setting file size for {path}: {size} bytes")
+            # print(f"Setting file size for {path}: {size} bytes")
+            logger.info(f"Setting file size for {path}: {size} bytes")
 
         return st
 
@@ -144,6 +149,7 @@ class Passthrough(Fuse):
     # ============
 
     def open(self, path, flags):
+        logger.info(f"open() called for path: {path}")
         full_path = os.path.join(self.mount, path.lstrip('/'))
         path_split = full_path.split("/")
 
@@ -152,7 +158,7 @@ class Passthrough(Fuse):
             udf, bucket_name, file_name = udf_fields
 
             formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
-            print(f"Making API call at {formatted_time}")
+            logger.info(f"Making API call at {formatted_time} for file: {file_name}")
             try:
                 params = {
                     "f": "json",
@@ -189,15 +195,17 @@ class Passthrough(Fuse):
                 # print(f"{response.content.decode('ascii')=}{response.status_code=}")
                 response.raise_for_status()
                 self.api_response_data[full_path] = response.content
+                logger.info(f"API call successful for {file_name}, received {len(response.content)} bytes")
                 self.getattr(path)
                 return 0
             except Exception as e:
-                print(f"API call failed: {e}")
+                logger.error(f"API call failed: {e}")
                 return -errno.EIO
         else:
             return os.open(full_path, flags)
     
     def read(self, path, size, offset):
+        logger.info(f"read() called for path: {path}, size: {size}, offset: {offset}")
         full_path = os.path.join(self.mount, path.lstrip('/'))
         if full_path in self.api_response_data:
             data = self.api_response_data[full_path]
@@ -205,6 +213,7 @@ class Passthrough(Fuse):
             
             # Ensure the offset is within bounds
             if offset >= data_length:
+                logger.warning(f"Offset {offset} beyond data length {data_length}, returning empty.")
                 return b''
             
             # slice_end = min(offset + size, data_length)
@@ -214,13 +223,12 @@ class Passthrough(Fuse):
             slice_end = min(offset + size, data_length)
             data_slice = data[offset:slice_end]
             
-            # Debug output
-            print(f"Returning data slice from {offset} to {slice_end}: {data_slice}")
+            logger.info(f"Returning data slice from {offset} to {slice_end} (size {len(data_slice)} bytes)")
 
-            # Return the requested data slice
             return data_slice
         else:
             # If the data is not found in memory, return an error or empty data
+            logger.warning(f"No API data found for path: {path}")
             return b''
 
 def main():
@@ -243,7 +251,7 @@ Userspace nullfs-alike: mirror the filesystem tree from some point on.
         if server.fuse_args.mount_expected():
             os.chdir(server.root)
     except OSError:
-        print("can't enter root of underlying filesystem", file=sys.stderr)
+        logger.error("can't enter root of underlying filesystem", file=sys.stderr)
         sys.exit(1)
 
     server.main()
